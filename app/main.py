@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -57,6 +62,26 @@ SESSIONS: dict[str, int] = {}
 DEFAULT_FLAGS = ["dashboard", "trade", "watchlist", "analysis", "portfolio", "alerts", "configuration"]
 
 
+TV_RESOLUTION_TO_KITE_INTERVAL = {
+    "1": "minute",
+    "3": "3minute",
+    "5": "5minute",
+    "10": "10minute",
+    "15": "15minute",
+    "30": "30minute",
+    "60": "60minute",
+    "120": "120minute",
+    "180": "180minute",
+    "240": "240minute",
+    "1D": "day",
+    "D": "day",
+    "1W": "week",
+    "W": "week",
+}
+
+INSTRUMENT_CACHE: dict[str, tuple[str, datetime]] = {}
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -71,6 +96,15 @@ class CreateUserRequest(BaseModel):
 
 class FeatureFlagUpdate(BaseModel):
     enabled: bool
+
+
+class KiteConfigRequest(BaseModel):
+    api_key: str
+    api_secret: str
+
+
+class KiteSessionExchangeRequest(BaseModel):
+    request_token: str
 
 
 class TradeRequest(BaseModel):
@@ -105,10 +139,44 @@ class ConditionalOrderRequest(BaseModel):
 
 
 class KiteBroker:
-    """Local mock adapter; swap with real Kite Connect calls."""
+    """Kite Connect adapter with automatic fallback to local mock."""
+
+    base_url = os.getenv("KITE_BASE_URL", "https://api.kite.trade").rstrip("/")
 
     @staticmethod
     def place_order(symbol: str, side: str, quantity: int, price: float) -> dict[str, Any]:
+        with db_conn() as conn:
+            api_key = get_setting(conn, "kite_api_key")
+            access_token = get_setting(conn, "kite_access_token")
+
+        if api_key and access_token:
+            exchange, tradingsymbol = KiteBroker._split_symbol(symbol)
+            payload = {
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": side.upper(),
+                "quantity": quantity,
+                "price": price,
+                "order_type": "LIMIT",
+                "product": "CNC",
+                "validity": "DAY",
+            }
+            body = KiteBroker._kite_post("/orders/regular", payload, api_key, access_token)
+            if body.get("status") != "success":
+                raise HTTPException(status_code=502, detail=f"Kite API rejected order: {body}")
+
+            return {
+                "broker": "kite-live",
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "broker_order_id": body.get("data", {}).get("order_id"),
+                "status": "submitted",
+                "timestamp": now_iso(),
+                "raw": body,
+            }
+
         return {
             "broker": "kite-mock",
             "symbol": symbol,
@@ -119,6 +187,141 @@ class KiteBroker:
             "status": "submitted",
             "timestamp": now_iso(),
         }
+
+    @staticmethod
+    def create_login_url(api_key: str) -> str:
+        return f"https://kite.trade/connect/login?v=3&api_key={urllib.parse.quote_plus(api_key)}"
+
+    @staticmethod
+    def create_access_token(api_key: str, api_secret: str, request_token: str) -> dict[str, Any]:
+        checksum = hashlib.sha256(f"{api_key}{request_token}{api_secret}".encode("utf-8")).hexdigest()
+        body = KiteBroker._kite_post(
+            "/session/token",
+            {"api_key": api_key, "request_token": request_token, "checksum": checksum},
+            api_key,
+            None,
+        )
+        if body.get("status") != "success":
+            raise HTTPException(status_code=502, detail=f"Kite login failed: {body}")
+        return body
+
+    @staticmethod
+    def _kite_post(path: str, payload: dict[str, Any], api_key: str, access_token: str | None) -> dict[str, Any]:
+        encoded_payload = urllib.parse.urlencode(payload).encode("utf-8")
+        headers = {"X-Kite-Version": "3", "Content-Type": "application/x-www-form-urlencoded"}
+        if access_token:
+            headers["Authorization"] = f"token {api_key}:{access_token}"
+
+        req = urllib.request.Request(
+            f"{KiteBroker.base_url}{path}",
+            data=encoded_payload,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=502, detail=f"Kite API error: {detail or exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=f"Kite API unavailable: {exc}") from exc
+
+    @staticmethod
+    def get_historical_candles(
+        symbol: str,
+        resolution: str,
+        from_ts: int,
+        to_ts: int,
+    ) -> list[list[Any]]:
+        kite_interval = TV_RESOLUTION_TO_KITE_INTERVAL.get(resolution.upper(), TV_RESOLUTION_TO_KITE_INTERVAL.get(resolution))
+        if not kite_interval:
+            raise HTTPException(status_code=400, detail=f"Unsupported resolution: {resolution}")
+
+        with db_conn() as conn:
+            api_key = get_setting(conn, "kite_api_key")
+            access_token = get_setting(conn, "kite_access_token")
+
+        if not api_key or not access_token:
+            raise HTTPException(status_code=400, detail="Kite is not connected. Configure and login from Configuration.")
+
+        exchange, tradingsymbol = KiteBroker._split_symbol(symbol)
+        instrument_token = KiteBroker._instrument_token_for_symbol(exchange, tradingsymbol, api_key, access_token)
+        path = f"/instruments/historical/{instrument_token}/{kite_interval}"
+        query = {
+            "from": datetime.fromtimestamp(from_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "to": datetime.fromtimestamp(to_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "continuous": "0",
+            "oi": "0",
+        }
+        body = KiteBroker._kite_get(path, query, api_key, access_token)
+        if body.get("status") != "success":
+            raise HTTPException(status_code=502, detail=f"Kite history failed: {body}")
+        return body.get("data", {}).get("candles", [])
+
+    @staticmethod
+    def _instrument_token_for_symbol(exchange: str, tradingsymbol: str, api_key: str, access_token: str) -> str:
+        cache_key = f"{exchange}:{tradingsymbol}".upper()
+        cached = INSTRUMENT_CACHE.get(cache_key)
+        if cached and (datetime.utcnow() - cached[1]).total_seconds() < 1800:
+            return cached[0]
+
+        csv_text = KiteBroker._kite_get_csv(f"/instruments/{exchange}", api_key, access_token)
+        for line in csv_text.splitlines()[1:]:
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            if parts[2].strip().upper() == tradingsymbol.upper():
+                token = parts[0].strip()
+                INSTRUMENT_CACHE[cache_key] = (token, datetime.utcnow())
+                return token
+        raise HTTPException(status_code=404, detail=f"Symbol not found on {exchange}: {tradingsymbol}")
+
+    @staticmethod
+    def _kite_get(path: str, query: dict[str, Any], api_key: str, access_token: str) -> dict[str, Any]:
+        qs = urllib.parse.urlencode(query)
+        req = urllib.request.Request(
+            f"{KiteBroker.base_url}{path}?{qs}",
+            headers={
+                "X-Kite-Version": "3",
+                "Authorization": f"token {api_key}:{access_token}",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=502, detail=f"Kite API error: {detail or exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=f"Kite API unavailable: {exc}") from exc
+
+    @staticmethod
+    def _kite_get_csv(path: str, api_key: str, access_token: str) -> str:
+        req = urllib.request.Request(
+            f"{KiteBroker.base_url}{path}",
+            headers={
+                "X-Kite-Version": "3",
+                "Authorization": f"token {api_key}:{access_token}",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise HTTPException(status_code=502, detail=f"Kite API error: {detail or exc.reason}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=f"Kite API unavailable: {exc}") from exc
+
+    @staticmethod
+    def _split_symbol(symbol: str) -> tuple[str, str]:
+        if ":" in symbol:
+            exchange, tradingsymbol = symbol.split(":", 1)
+            return exchange.upper(), tradingsymbol.upper()
+        return "NSE", symbol.upper()
 
 
 def init_db() -> None:
@@ -204,6 +407,10 @@ def init_db() -> None:
                 UNIQUE(user_id, feature_name),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             """
         )
 
@@ -260,6 +467,18 @@ def require_admin(user: sqlite3.Row = Depends(get_current_user)) -> sqlite3.Row:
 
 def serialize_row(row: sqlite3.Row) -> dict[str, Any]:
     return {k: row[k] for k in row.keys()}
+
+
+def get_setting(conn: sqlite3.Connection, key: str) -> str:
+    row = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else ""
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO app_settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
 
 
 def apply_execution(conn: sqlite3.Connection, order_id: int) -> None:
@@ -421,6 +640,150 @@ def set_max_investment(user_id: int, payload: dict[str, float], user: sqlite3.Ro
     with db_conn() as conn:
         conn.execute("UPDATE users SET max_investment_per_stock=? WHERE id=?", (value, user_id))
     return {"ok": True}
+
+
+@app.get("/api/kite/config")
+def kite_config(user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    with db_conn() as conn:
+        return {
+            "has_api_key": bool(get_setting(conn, "kite_api_key")),
+            "has_api_secret": bool(get_setting(conn, "kite_api_secret")),
+            "is_connected": bool(get_setting(conn, "kite_access_token")),
+            "kite_user_name": get_setting(conn, "kite_user_name"),
+        }
+
+
+@app.put("/api/kite/config")
+def save_kite_config(payload: KiteConfigRequest, user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    with db_conn() as conn:
+        set_setting(conn, "kite_api_key", payload.api_key.strip())
+        set_setting(conn, "kite_api_secret", payload.api_secret.strip())
+        set_setting(conn, "kite_access_token", "")
+        set_setting(conn, "kite_user_name", "")
+    return {"saved": True}
+
+
+@app.post("/api/kite/login-url")
+def kite_login_url(user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    with db_conn() as conn:
+        api_key = get_setting(conn, "kite_api_key")
+    if not api_key:
+        raise HTTPException(400, "Please save Kite API key and secret first")
+    return {"url": KiteBroker.create_login_url(api_key)}
+
+
+@app.post("/api/kite/exchange-session")
+def kite_exchange_session(payload: KiteSessionExchangeRequest, user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    with db_conn() as conn:
+        api_key = get_setting(conn, "kite_api_key")
+        api_secret = get_setting(conn, "kite_api_secret")
+
+    if not api_key or not api_secret:
+        raise HTTPException(400, "Kite API key/secret not configured")
+
+    kite_data = KiteBroker.create_access_token(api_key, api_secret, payload.request_token)
+    data = kite_data.get("data", {})
+    with db_conn() as conn:
+        set_setting(conn, "kite_access_token", data.get("access_token", ""))
+        set_setting(conn, "kite_user_name", data.get("user_name", ""))
+
+    return {
+        "connected": True,
+        "kite_user_name": data.get("user_name", ""),
+        "public_token": data.get("public_token", ""),
+    }
+
+
+@app.get("/kite/callback", response_class=HTMLResponse)
+def kite_callback() -> HTMLResponse:
+    return HTMLResponse(
+        """
+        <!doctype html>
+        <html>
+          <body>
+            <script>
+              const params = new URLSearchParams(window.location.search);
+              const requestToken = params.get('request_token');
+              const status = params.get('status');
+              if (window.opener) {
+                window.opener.postMessage({ type: 'kite-auth', requestToken, status }, window.location.origin);
+              }
+              window.close();
+            </script>
+            <p>Kite authentication complete. You can close this window.</p>
+          </body>
+        </html>
+        """
+    )
+
+
+@app.get("/api/tradingview/config")
+def tradingview_config(user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    return {
+        "supports_search": False,
+        "supports_group_request": False,
+        "supports_marks": False,
+        "supports_timescale_marks": False,
+        "supports_time": True,
+        "supported_resolutions": ["1", "3", "5", "10", "15", "30", "60", "120", "240", "1D", "1W"],
+    }
+
+
+@app.get("/api/tradingview/symbols")
+def tradingview_symbol(symbol: str, user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    exchange, tradingsymbol = KiteBroker._split_symbol(symbol)
+    return {
+        "name": f"{exchange}:{tradingsymbol}",
+        "ticker": f"{exchange}:{tradingsymbol}",
+        "description": f"{tradingsymbol} ({exchange})",
+        "type": "stock",
+        "session": "0915-1530",
+        "timezone": "Asia/Kolkata",
+        "exchange": exchange,
+        "listed_exchange": exchange,
+        "minmov": 1,
+        "pricescale": 100,
+        "has_intraday": True,
+        "has_weekly_and_monthly": True,
+        "supported_resolutions": ["1", "3", "5", "10", "15", "30", "60", "120", "240", "1D", "1W"],
+        "data_status": "streaming",
+    }
+
+
+@app.get("/api/tradingview/history")
+def tradingview_history(
+    symbol: str,
+    resolution: str,
+    from_ts: int = Query(alias="from"),
+    to_ts: int = Query(alias="to"),
+    user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    candles = KiteBroker.get_historical_candles(symbol, resolution, from_ts, to_ts)
+    if not candles:
+        return {"s": "no_data"}
+
+    t: list[int] = []
+    o: list[float] = []
+    h: list[float] = []
+    l: list[float] = []
+    c: list[float] = []
+    v: list[float] = []
+    for candle in candles:
+        t.append(int(datetime.fromisoformat(candle[0].replace("Z", "+00:00")).timestamp()))
+        o.append(float(candle[1]))
+        h.append(float(candle[2]))
+        l.append(float(candle[3]))
+        c.append(float(candle[4]))
+        v.append(float(candle[5] if len(candle) > 5 else 0))
+
+    return {"s": "ok", "t": t, "o": o, "h": h, "l": l, "c": c, "v": v}
 
 
 @app.post("/api/trades")

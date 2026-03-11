@@ -8,7 +8,7 @@ A local-first enterprise-style asset management platform for Admin/User workflow
 - Trade placement with market-hours aware execution (open vs executed orders)
 - Portfolio, funds, watchlists, alerts, conditional orders
 - Admin dashboard + user management
-- Analysis workspace with chart widget + trendline-capable embedded chart
+- Analysis workspace with TradingView chart backed by a FastAPI datafeed server
 - SQLite persistence (`data/app.db`) for permanent local memory
 
 ## Run locally
@@ -25,5 +25,10 @@ Open http://127.0.0.1:8000
 - User: `demo / demo123`
 
 ## Notes
-- `KiteBroker` adapter is included with a local mock implementation. Replace internals in `KiteBroker.place_order` with real Zerodha Kite Connect API calls.
+- `KiteBroker` calls the live Kite order endpoint (`POST https://api.kite.trade/orders/regular`) when Kite is connected from the **Configuration** page.
+- Configure only Kite API key + API secret, then use **Login with Kite**; the app exchanges the returned `request_token` for an access token automatically.
+- Set your Kite app redirect URL to `/kite/callback` on this app host so popup login can complete.
+- FastAPI exposes TradingView-compatible datafeed endpoints (`/api/tradingview/config`, `/api/tradingview/symbols`, `/api/tradingview/history`) that pull NSE candles from Kite historical APIs.
+- Use optional `KITE_BASE_URL` environment variable to override the endpoint host for testing/sandbox.
+- If Kite is not connected, it safely falls back to local mock orders so local development still works end-to-end.
 - This is a local development build focused on complete E2E workflow.
