@@ -72,7 +72,49 @@ async function renderWatchlist() {
 }
 
 function renderAnalysis() {
-  return `<div class='card card-soft p-3'><h5>Analysis</h5><p>Use TradingView chart for flexible durations and trendline drawing tools.</p><div id='tvchart' style='height:520px'></div></div>`;
+  return `<div class='card card-soft p-3'><h5>Analysis</h5><p>TradingView chart backed by Kite NSE candles via the FastAPI datafeed.</p><div id='tvchart' style='height:520px'></div></div>`;
+}
+
+function buildTradingViewDatafeed() {
+  return {
+    onReady: async (cb) => {
+      const config = await api('/api/tradingview/config');
+      setTimeout(() => cb(config), 0);
+    },
+    resolveSymbol: async (symbolName, onResolve, onError) => {
+      try {
+        const info = await api(`/api/tradingview/symbols?symbol=${encodeURIComponent(symbolName)}`);
+        onResolve(info);
+      } catch (e) {
+        onError(e.message);
+      }
+    },
+    getBars: async (symbolInfo, resolution, periodParams, onHistory, onError) => {
+      try {
+        const from = periodParams.from || Math.floor(Date.now() / 1000) - (7 * 24 * 60 * 60);
+        const to = periodParams.to || Math.floor(Date.now() / 1000);
+        const data = await api(`/api/tradingview/history?symbol=${encodeURIComponent(symbolInfo.ticker || symbolInfo.name)}&resolution=${encodeURIComponent(String(resolution))}&from=${from}&to=${to}`);
+        if (data.s !== 'ok') {
+          onHistory([], { noData: true });
+          return;
+        }
+
+        const bars = data.t.map((t, i) => ({
+          time: t * 1000,
+          open: data.o[i],
+          high: data.h[i],
+          low: data.l[i],
+          close: data.c[i],
+          volume: data.v[i],
+        }));
+        onHistory(bars, { noData: bars.length === 0 });
+      } catch (e) {
+        onError(e.message);
+      }
+    },
+    subscribeBars: () => {},
+    unsubscribeBars: () => {},
+  };
 }
 
 async function renderPortfolio() {
@@ -91,7 +133,19 @@ async function renderAlerts() {
 
 async function renderConfiguration() {
   const funds = await api('/api/funds');
-  return `<div class='card card-soft p-3'><h5>Configuration</h5><p>Fund balance: <strong>${funds.balance.toFixed(2)}</strong></p><div class='d-flex gap-2'><input id='maxInvest' type='number' class='form-control' placeholder='Max investment per stock'/><button id='saveMax' class='btn btn-primary'>Save</button></div></div>`;
+  const kite = await api('/api/kite/config');
+  return `<div class='card card-soft p-3 mb-3'><h5>Configuration</h5><p>Fund balance: <strong>${funds.balance.toFixed(2)}</strong></p><div class='d-flex gap-2'><input id='maxInvest' type='number' class='form-control' placeholder='Max investment per stock'/><button id='saveMax' class='btn btn-primary'>Save</button></div></div>
+  <div class='card card-soft p-3'>
+    <h5>Kite Broker Setup</h5>
+    <p class='mb-1'>Configure Kite once with API key + API secret, then use <strong>Login with Kite</strong> to fetch the access token automatically.</p>
+    <small class='text-muted d-block mb-3'>Status: ${kite.is_connected ? `Connected as ${kite.kite_user_name || 'Kite user'}` : 'Not connected'}</small>
+    <div class='row g-2 mb-2'>
+      <div class='col-md-5'><input id='kiteApiKey' class='form-control' placeholder='Kite API Key'/></div>
+      <div class='col-md-5'><input id='kiteApiSecret' type='password' class='form-control' placeholder='Kite API Secret'/></div>
+      <div class='col-md-2'><button id='saveKiteConfig' class='btn btn-outline-primary w-100'>Save</button></div>
+    </div>
+    <button id='kiteLogin' class='btn btn-primary'>Login with Kite</button>
+  </div>`;
 }
 
 async function renderAdmin() {
@@ -121,6 +175,7 @@ async function renderView() {
       autosize: true,
       symbol: 'NSE:INFY',
       interval: '60',
+      datafeed: buildTradingViewDatafeed(),
       container_id: 'tvchart',
       theme: 'light',
       style: '1',
@@ -180,6 +235,32 @@ function bindActions() {
     alert('Saved');
   });
 
+
+  document.getElementById('saveKiteConfig')?.addEventListener('click', async () => {
+    try {
+      await api('/api/kite/config', { method: 'PUT', body: JSON.stringify({
+        api_key: document.getElementById('kiteApiKey').value.trim(),
+        api_secret: document.getElementById('kiteApiSecret').value.trim(),
+      }) });
+      alert('Kite API credentials saved.');
+      renderView();
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
+  document.getElementById('kiteLogin')?.addEventListener('click', async () => {
+    try {
+      const data = await api('/api/kite/login-url', { method: 'POST' });
+      const popup = window.open(data.url, 'kite-login', 'width=640,height=780');
+      if (!popup) {
+        alert('Popup blocked. Please allow popups and retry Kite login.');
+      }
+    } catch (e) {
+      alert(e.message);
+    }
+  });
+
   document.getElementById('createUser')?.addEventListener('click', async () => {
     await api('/api/users', { method: 'POST', body: JSON.stringify({ username: nUser.value, password: nPass.value, role: nRole.value, initial_funds: 100000 })});
     renderView();
@@ -208,6 +289,27 @@ document.getElementById('loginBtn').addEventListener('click', async () => {
     renderView();
   } catch (e) {
     loginError.innerText = e.message;
+  }
+});
+
+
+window.addEventListener('message', async (event) => {
+  if (event.origin !== window.location.origin) return;
+  if (event.data?.type !== 'kite-auth') return;
+  if (!event.data.requestToken || event.data.status !== 'success') {
+    alert('Kite login failed or cancelled.');
+    return;
+  }
+
+  try {
+    const result = await api('/api/kite/exchange-session', {
+      method: 'POST',
+      body: JSON.stringify({ request_token: event.data.requestToken }),
+    });
+    alert(`Kite connected successfully${result.kite_user_name ? ` as ${result.kite_user_name}` : ''}.`);
+    if (state.view === 'configuration') renderView();
+  } catch (e) {
+    alert(e.message);
   }
 });
 
