@@ -3,9 +3,65 @@ const state = {
   me: null,
   features: {},
   view: 'dashboard',
+  analysisSymbol: 'NSE:INFY',
 };
 
 const navItems = ['dashboard', 'trade', 'watchlist', 'analysis', 'portfolio', 'alerts', 'configuration', 'admin'];
+
+
+function normalizeSymbol(value) {
+  const raw = (value || '').trim().toUpperCase();
+  if (!raw) return '';
+  return raw.includes(':') ? raw : `NSE:${raw}`;
+}
+
+function formatInr(price) {
+  if (!Number.isFinite(price)) return '--';
+  return `₹${price.toFixed(2)}`;
+}
+
+async function updateQuote(symbolInputId, priceInputId, quoteLabelId) {
+  const input = document.getElementById(symbolInputId);
+  const symbol = normalizeSymbol(input?.value || '');
+  if (!symbol) return;
+  try {
+    const quote = await api(`/api/quote?symbol=${encodeURIComponent(symbol)}`);
+    if (priceInputId) {
+      const priceInput = document.getElementById(priceInputId);
+      if (priceInput && Number(quote.price) > 0) priceInput.value = Number(quote.price).toFixed(2);
+    }
+    if (quoteLabelId) {
+      const label = document.getElementById(quoteLabelId);
+      if (label) label.innerText = `Current price: ${formatInr(Number(quote.price))}`;
+    }
+  } catch (e) {
+    const label = document.getElementById(quoteLabelId);
+    if (label) label.innerText = 'Current price: unavailable';
+  }
+}
+
+function attachStockAssist(symbolInputId, listId, quoteLabelId, priceInputId = null) {
+  const input = document.getElementById(symbolInputId);
+  const list = document.getElementById(listId);
+  if (!input || !list) return;
+  input.setAttribute('list', listId);
+
+  const refreshSuggestions = async () => {
+    const q = input.value.trim();
+    try {
+      const data = await api(`/api/stock-search?q=${encodeURIComponent(q)}&limit=8`);
+      list.innerHTML = (data.results || []).map((r) => `<option value="${r.symbol}">${r.name || r.symbol}</option>`).join('');
+    } catch (_e) {
+      list.innerHTML = '';
+    }
+  };
+
+  input.addEventListener('input', refreshSuggestions);
+  input.addEventListener('focus', refreshSuggestions);
+  input.addEventListener('change', () => updateQuote(symbolInputId, priceInputId, quoteLabelId));
+  refreshSuggestions();
+}
+
 
 function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
@@ -49,13 +105,13 @@ async function renderTrade() {
   return `
   <div class="card card-soft p-3 mb-3">
     <h5>Place Trade</h5>
-    <div class="row g-2">
-      <div class="col"><input id="tSymbol" class="form-control" placeholder="Symbol e.g. INFY"/></div>
-      <div class="col"><select id="tSide" class="form-select"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
-      <div class="col"><input id="tQty" class="form-control" type="number" value="1"/></div>
-      <div class="col"><input id="tPrice" class="form-control" type="number" value="100"/></div>
-      ${state.me.user.role === 'admin' ? `<div class="col"><select id="tUsers" class="form-select" multiple>${users.filter(u=>u.role==='user').map(u=>`<option value='${u.id}'>${u.username}</option>`).join('')}</select></div>`: ''}
-      <div class="col"><button id="placeTrade" class="btn btn-primary">Submit</button></div>
+    <div class="row g-2 align-items-end">
+      <div class="col-md-3"><input id="tSymbol" class="form-control" placeholder="Symbol e.g. NSE:INFY"/><datalist id="tSymbolList"></datalist><small id="tQuote" class="text-muted">Current price: --</small></div>
+      <div class="col-md-2"><select id="tSide" class="form-select"><option value="buy">Buy</option><option value="sell">Sell</option></select></div>
+      <div class="col-md-2"><input id="tQty" class="form-control" type="number" value="1"/></div>
+      <div class="col-md-2"><input id="tPrice" class="form-control" type="number" value="100"/></div>
+      ${state.me.user.role === 'admin' ? `<div class="col-md-2"><select id="tUsers" class="form-select" multiple>${users.filter(u=>u.role==='user').map(u=>`<option value='${u.id}'>${u.username}</option>`).join('')}</select></div>`: ''}
+      <div class="col-md-1"><button id="placeTrade" class="btn btn-primary w-100">Submit</button></div>
     </div>
   </div>
   <div class="card card-soft p-3">
@@ -68,11 +124,11 @@ async function renderTrade() {
 async function renderWatchlist() {
   const lists = await api('/api/watchlists');
   return `<div class='card card-soft p-3 mb-3'><h5>Create Watchlist</h5><div class='d-flex gap-2'><input id='wName' class='form-control' placeholder='Long term'/><button id='createW' class='btn btn-primary'>Create</button></div></div>
-  ${lists.map(w => `<div class='card card-soft p-3 mb-2'><h6>${w.name} (#${w.id})</h6><p>${(w.symbols||[]).join(', ') || 'No symbols yet'}</p><div class='d-flex gap-2'><input id='sym-${w.id}' class='form-control' placeholder='Add symbol'/><button class='btn btn-outline-primary' onclick='window.addSym(${w.id})'>Add</button></div></div>`).join('')}`;
+  ${lists.map(w => `<div class='card card-soft p-3 mb-2'><h6>${w.name} (#${w.id})</h6><p>${(w.symbols||[]).join(', ') || 'No symbols yet'}</p><div class='d-flex gap-2 align-items-end'><div class='w-100'><input id='sym-${w.id}' class='form-control' placeholder='Add symbol'/><datalist id='sym-list-${w.id}'></datalist><small id='sym-quote-${w.id}' class='text-muted'>Current price: --</small></div><button class='btn btn-outline-primary' onclick='window.addSym(${w.id})'>Add</button></div></div>`).join('')}`;
 }
 
 function renderAnalysis() {
-  return `<div class='card card-soft p-3'><h5>Analysis</h5><p>TradingView chart backed by Kite NSE candles via the FastAPI datafeed.</p><div id='tvchart' style='height:520px'></div></div>`;
+  return `<div class='card card-soft p-3'><h5>Analysis</h5><p>Search any stock and load the TradingView chart (Kite backed).</p><div class='row g-2 mb-2 align-items-end'><div class='col-md-5'><input id='analysisSymbol' class='form-control' placeholder='NSE:INFY' value='${state.analysisSymbol || 'NSE:INFY'}'/><datalist id='analysisSymbolList'></datalist><small id='analysisQuote' class='text-muted'>Current price: --</small></div><div class='col-md-2'><button id='loadAnalysisSymbol' class='btn btn-outline-primary'>Load Chart</button></div></div><div id='tvchart' style='height:520px'></div></div>`;
 }
 
 function buildTradingViewDatafeed() {
@@ -80,6 +136,21 @@ function buildTradingViewDatafeed() {
     onReady: async (cb) => {
       const config = await api('/api/tradingview/config');
       setTimeout(() => cb(config), 0);
+    },
+    searchSymbols: async (userInput, exchange, symbolType, onResult) => {
+      try {
+        const data = await api(`/api/stock-search?q=${encodeURIComponent(userInput || '')}&exchange=${encodeURIComponent(exchange || 'NSE')}&limit=15`);
+        onResult((data.results || []).map((r) => ({
+          symbol: r.symbol,
+          full_name: r.symbol,
+          description: r.name || r.symbol,
+          exchange: (r.symbol.split(':')[0] || 'NSE'),
+          ticker: r.symbol,
+          type: symbolType || 'stock',
+        })));
+      } catch (_e) {
+        onResult([]);
+      }
     },
     resolveSymbol: async (symbolName, onResolve, onError) => {
       try {
@@ -121,13 +192,13 @@ async function renderPortfolio() {
   const p = await api('/api/portfolio');
   const conditional = await api('/api/conditional-orders');
   return `<div class='card card-soft p-3 mb-3'><h5>Holdings</h5><table class='table'><thead><tr><th>User</th><th>Symbol</th><th>Qty</th><th>Avg Price</th></tr></thead><tbody>${p.holdings.map(h=>`<tr><td>${h.username || state.me.user.username}</td><td>${h.symbol}</td><td>${h.quantity}</td><td>${h.avg_price}</td></tr>`).join('')}</tbody></table></div>
-  <div class='card card-soft p-3 mb-3'><h5>Portfolio Review Action</h5><div class='row g-2'><div class='col'><input id='cSymbol' class='form-control' placeholder='Symbol'/></div><div class='col'><select id='cAction' class='form-select'><option value='buy_more'>Buy More</option><option value='sell_qty'>Sell Quantity</option><option value='buy_if'>Buy if</option><option value='sell_if'>Sell if</option></select></div><div class='col'><select id='cType' class='form-select'><option value='closes_above'>Price closes above</option><option value='closes_below'>Price closes below</option><option value='reaches'>Price reaches</option></select></div><div class='col'><input id='cValue' class='form-control' type='number' placeholder='Trigger value'/></div><div class='col'><input id='cQty' class='form-control' type='number' value='1'/></div><div class='col'><button id='addCond' class='btn btn-primary'>Add</button></div></div></div>
+  <div class='card card-soft p-3 mb-3'><h5>Portfolio Review Action</h5><div class='row g-2'><div class='col'><input id='cSymbol' class='form-control' placeholder='Symbol'/><datalist id='cSymbolList'></datalist><small id='cQuote' class='text-muted'>Current price: --</small></div><div class='col'><select id='cAction' class='form-select'><option value='buy_more'>Buy More</option><option value='sell_qty'>Sell Quantity</option><option value='buy_if'>Buy if</option><option value='sell_if'>Sell if</option></select></div><div class='col'><select id='cType' class='form-select'><option value='closes_above'>Price closes above</option><option value='closes_below'>Price closes below</option><option value='reaches'>Price reaches</option></select></div><div class='col'><input id='cValue' class='form-control' type='number' placeholder='Trigger value'/></div><div class='col'><input id='cQty' class='form-control' type='number' value='1'/></div><div class='col'><button id='addCond' class='btn btn-primary'>Add</button></div></div></div>
   <div class='card card-soft p-3'><h5>Conditional Orders</h5><ul>${conditional.map(c=>`<li>${c.symbol} ${c.action} when ${c.condition_type} ${c.trigger_value} qty ${c.quantity}</li>`).join('')}</ul></div>`;
 }
 
 async function renderAlerts() {
   const alerts = await api('/api/alerts');
-  return `<div class='card card-soft p-3 mb-3'><h5>Create Alert</h5><div class='row g-2'><div class='col'><input id='aSymbol' class='form-control' placeholder='RELIANCE'/></div><div class='col'><select id='aCond' class='form-select'><option value='reaches'>Price reaches to</option><option value='closes_above'>Price closes above</option><option value='closes_below'>Price closes below</option></select></div><div class='col'><input id='aValue' type='number' class='form-control' placeholder='value'/></div><div class='col'><select id='aDur' class='form-select'><option>15m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option><option>1w</option><option>1mo</option></select></div><div class='col'><button id='createAlert' class='btn btn-primary'>Create</button></div></div></div>
+  return `<div class='card card-soft p-3 mb-3'><h5>Create Alert</h5><div class='row g-2'><div class='col'><input id='aSymbol' class='form-control' placeholder='NSE:RELIANCE'/><datalist id='aSymbolList'></datalist><small id='aQuote' class='text-muted'>Current price: --</small></div><div class='col'><select id='aCond' class='form-select'><option value='reaches'>Price reaches to</option><option value='closes_above'>Price closes above</option><option value='closes_below'>Price closes below</option></select></div><div class='col'><input id='aValue' type='number' class='form-control' placeholder='value'/></div><div class='col'><select id='aDur' class='form-select'><option>15m</option><option>30m</option><option>1h</option><option>4h</option><option>1d</option><option>1w</option><option>1mo</option></select></div><div class='col'><button id='createAlert' class='btn btn-primary'>Create</button></div></div></div>
   <div class='card card-soft p-3'><h5>Active Alerts</h5><ul>${alerts.map(a=>`<li>${a.symbol} ${a.condition} ${a.value} (${a.duration})</li>`).join('')}</ul></div>`;
 }
 
@@ -138,7 +209,7 @@ async function renderConfiguration() {
   <div class='card card-soft p-3'>
     <h5>Kite Broker Setup</h5>
     <p class='mb-1'>Configure Kite once with API key + API secret, then use <strong>Login with Kite</strong> to fetch the access token automatically.</p>
-    <small class='text-muted d-block mb-3'>Status: ${kite.is_connected ? `Connected as ${kite.kite_user_name || 'Kite user'}` : 'Not connected'}</small>
+    <small class='text-muted d-block mb-3'>Connection status: ${kite.is_connected ? `Connected as ${kite.kite_user_name || 'Kite user'}` : 'Not connected'}</small>
     <div class='row g-2 mb-2'>
       <div class='col-md-5'><input id='kiteApiKey' class='form-control' placeholder='Kite API Key'/></div>
       <div class='col-md-5'><input id='kiteApiSecret' type='password' class='form-control' placeholder='Kite API Secret'/></div>
@@ -171,9 +242,10 @@ async function renderView() {
 
   bindActions();
   if (state.view === 'analysis' && window.TradingView) {
+    const symbol = state.analysisSymbol || 'NSE:INFY';
     new TradingView.widget({
       autosize: true,
-      symbol: 'NSE:INFY',
+      symbol,
       interval: '60',
       datafeed: buildTradingViewDatafeed(),
       container_id: 'tvchart',
@@ -194,7 +266,7 @@ function bindActions() {
     try {
       const selected = Array.from(document.getElementById('tUsers')?.selectedOptions || []).map(o => Number(o.value));
       await api('/api/trades', { method: 'POST', body: JSON.stringify({
-        symbol: document.getElementById('tSymbol').value,
+        symbol: normalizeSymbol(document.getElementById('tSymbol').value),
         side: document.getElementById('tSide').value,
         quantity: Number(document.getElementById('tQty').value),
         price: Number(document.getElementById('tPrice').value),
@@ -211,7 +283,7 @@ function bindActions() {
 
   document.getElementById('createAlert')?.addEventListener('click', async () => {
     await api('/api/alerts', { method: 'POST', body: JSON.stringify({
-      symbol: document.getElementById('aSymbol').value,
+      symbol: normalizeSymbol(document.getElementById('aSymbol').value),
       condition: document.getElementById('aCond').value,
       value: Number(document.getElementById('aValue').value),
       duration: document.getElementById('aDur').value,
@@ -221,7 +293,7 @@ function bindActions() {
 
   document.getElementById('addCond')?.addEventListener('click', async () => {
     await api('/api/conditional-orders', { method: 'POST', body: JSON.stringify({
-      symbol: document.getElementById('cSymbol').value,
+      symbol: normalizeSymbol(document.getElementById('cSymbol').value),
       action: document.getElementById('cAction').value,
       condition_type: document.getElementById('cType').value,
       trigger_value: Number(document.getElementById('cValue').value),
@@ -261,6 +333,25 @@ function bindActions() {
     }
   });
 
+
+
+  attachStockAssist('tSymbol', 'tSymbolList', 'tQuote', 'tPrice');
+  attachStockAssist('aSymbol', 'aSymbolList', 'aQuote');
+  attachStockAssist('cSymbol', 'cSymbolList', 'cQuote');
+  updateQuote('tSymbol', 'tPrice', 'tQuote');
+
+  document.getElementById('loadAnalysisSymbol')?.addEventListener('click', async () => {
+    state.analysisSymbol = normalizeSymbol(document.getElementById('analysisSymbol').value);
+    if (!state.analysisSymbol) return;
+    renderView();
+  });
+  attachStockAssist('analysisSymbol', 'analysisSymbolList', 'analysisQuote');
+
+  document.querySelectorAll('input[id^="sym-"]').forEach((el) => {
+    const wid = el.id.replace('sym-', '');
+    attachStockAssist(`sym-${wid}`, `sym-list-${wid}`, `sym-quote-${wid}`);
+  });
+
   document.getElementById('createUser')?.addEventListener('click', async () => {
     await api('/api/users', { method: 'POST', body: JSON.stringify({ username: nUser.value, password: nPass.value, role: nRole.value, initial_funds: 100000 })});
     renderView();
@@ -272,7 +363,7 @@ window.delUser = async (id) => { await api(`/api/users/${id}`, { method: 'DELETE
 window.toggleFeature = async (uid, feature, enabled) => { await api(`/api/users/${uid}/features/${feature}`, { method: 'PUT', body: JSON.stringify({enabled}) }); };
 window.addSym = async (id) => {
   const el = document.getElementById(`sym-${id}`);
-  await api(`/api/watchlists/${id}/items`, { method: 'POST', body: JSON.stringify({ symbol: el.value }) });
+  await api(`/api/watchlists/${id}/items`, { method: 'POST', body: JSON.stringify({ symbol: normalizeSymbol(el.value) }) });
   renderView();
 };
 
