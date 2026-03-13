@@ -80,6 +80,19 @@ TV_RESOLUTION_TO_KITE_INTERVAL = {
 }
 
 INSTRUMENT_CACHE: dict[str, tuple[str, datetime]] = {}
+INSTRUMENT_LIST_CACHE: dict[str, tuple[list[dict[str, str]], datetime]] = {}
+DEFAULT_STOCKS = [
+    "NSE:INFY",
+    "NSE:TCS",
+    "NSE:RELIANCE",
+    "NSE:HDFCBANK",
+    "NSE:ICICIBANK",
+    "NSE:SBIN",
+    "NSE:ITC",
+    "NSE:LT",
+    "NSE:AXISBANK",
+    "NSE:KOTAKBANK",
+]
 
 
 class LoginRequest(BaseModel):
@@ -276,6 +289,70 @@ class KiteBroker:
                 INSTRUMENT_CACHE[cache_key] = (token, datetime.utcnow())
                 return token
         raise HTTPException(status_code=404, detail=f"Symbol not found on {exchange}: {tradingsymbol}")
+
+    @staticmethod
+    def get_ltp(symbol: str) -> float:
+        with db_conn() as conn:
+            api_key = get_setting(conn, "kite_api_key")
+            access_token = get_setting(conn, "kite_access_token")
+
+        if not api_key or not access_token:
+            return KiteBroker._mock_ltp(symbol)
+
+        body = KiteBroker._kite_get("/quote", {"i": symbol.upper()}, api_key, access_token)
+        if body.get("status") != "success":
+            raise HTTPException(status_code=502, detail=f"Kite quote failed: {body}")
+
+        data = body.get("data", {}).get(symbol.upper())
+        if not data:
+            raise HTTPException(status_code=404, detail=f"Quote not found for symbol {symbol.upper()}")
+        return float(data.get("last_price", 0))
+
+    @staticmethod
+    def search_symbols(query: str, exchange: str = "NSE", limit: int = 10) -> list[dict[str, str]]:
+        cleaned = query.strip().upper()
+        if not cleaned:
+            return [{"symbol": s, "name": s.split(":", 1)[1]} for s in DEFAULT_STOCKS[:limit]]
+
+        with db_conn() as conn:
+            api_key = get_setting(conn, "kite_api_key")
+            access_token = get_setting(conn, "kite_access_token")
+
+        if api_key and access_token:
+            instruments = KiteBroker._list_instruments(exchange, api_key, access_token)
+            starts = [i for i in instruments if i["name"].startswith(cleaned)]
+            contains = [i for i in instruments if cleaned in i["name"] and not i["name"].startswith(cleaned)]
+            return (starts + contains)[:limit]
+
+        defaults = [s for s in DEFAULT_STOCKS if cleaned in s]
+        return [{"symbol": s, "name": s.split(":", 1)[1]} for s in defaults[:limit]]
+
+    @staticmethod
+    def _list_instruments(exchange: str, api_key: str, access_token: str) -> list[dict[str, str]]:
+        exchange_key = exchange.upper()
+        cached = INSTRUMENT_LIST_CACHE.get(exchange_key)
+        if cached and (datetime.utcnow() - cached[1]).total_seconds() < 1800:
+            return cached[0]
+
+        rows: list[dict[str, str]] = []
+        csv_text = KiteBroker._kite_get_csv(f"/instruments/{exchange_key}", api_key, access_token)
+        for line in csv_text.splitlines()[1:]:
+            parts = line.split(",")
+            if len(parts) < 3:
+                continue
+            ts = parts[2].strip().upper()
+            if not ts:
+                continue
+            rows.append({"symbol": f"{exchange_key}:{ts}", "name": ts})
+
+        INSTRUMENT_LIST_CACHE[exchange_key] = (rows, datetime.utcnow())
+        return rows
+
+    @staticmethod
+    def _mock_ltp(symbol: str) -> float:
+        digest = hashlib.sha256(symbol.upper().encode()).hexdigest()
+        pseudo = int(digest[:8], 16) % 50000
+        return round(50 + (pseudo / 100), 2)
 
     @staticmethod
     def _kite_get(path: str, query: dict[str, Any], api_key: str, access_token: str) -> dict[str, Any]:
@@ -721,11 +798,27 @@ def kite_callback() -> HTMLResponse:
     )
 
 
+@app.get("/api/stock-search")
+def stock_search(
+    q: str = Query(default=""),
+    exchange: str = Query(default="NSE"),
+    limit: int = Query(default=10, ge=1, le=50),
+    user: sqlite3.Row = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    return {"results": KiteBroker.search_symbols(q, exchange, limit)}
+
+
+@app.get("/api/quote")
+def stock_quote(symbol: str, user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
+    _ = user
+    return {"symbol": symbol.upper(), "price": KiteBroker.get_ltp(symbol)}
+
 @app.get("/api/tradingview/config")
 def tradingview_config(user: sqlite3.Row = Depends(get_current_user)) -> dict[str, Any]:
     _ = user
     return {
-        "supports_search": False,
+        "supports_search": True,
         "supports_group_request": False,
         "supports_marks": False,
         "supports_timescale_marks": False,
